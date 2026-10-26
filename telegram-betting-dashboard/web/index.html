@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>多账号下注控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">LOCAL CONTROL CENTER</p>
+        <div class="brand-line"><span class="dino-mascot" aria-hidden="true">🦖</span><h1>多账号下注控制台</h1></div>
+        <p class="dino-tagline">DINO WATCH · 账号与群独立巡逻</p>
+      </div>
+      <div class="topbar-meta">
+        <span id="modeBadge" class="badge">连接中</span>
+        <span id="connectionDot" class="connection"><i></i> 数据同步中</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel account-panel" aria-label="Telegram 账号管理">
+        <div class="account-switcher">
+          <div><p class="eyebrow">TELEGRAM ACCOUNTS</p><h2>当前账号</h2></div>
+          <label class="account-select-label">账号切换<select id="accountSelect" aria-label="选择 Telegram 账号"></select></label>
+          <button id="addAccountButton" class="button primary" type="button">＋ 添加账号</button>
+          <button id="removeAccountButton" class="button danger" type="button">移除账号</button>
+        </div>
+        <p id="accountInfo" class="muted">正在读取账号…</p>
+      </section>
+
+      <section id="addAccountPanel" class="panel account-add-panel" hidden>
+        <div class="section-head"><div><p class="eyebrow">ADD ACCOUNT</p><h2>添加 Telegram 账号</h2></div><button id="cancelAccountButton" class="button ghost" type="button">取消</button></div>
+        <form id="accountCredentialsForm" class="account-form">
+          <label>账号备注<input id="accountLabel" type="text" maxlength="40" placeholder="例如：测试账号 2" autocomplete="off"></label>
+          <label>手机号（含国家区号）<input id="accountPhone" type="tel" required placeholder="+8613800000000" autocomplete="tel"></label>
+          <small class="muted shared-api-note">将自动使用当前程序的 Telegram API 配置，无需重复输入。</small>
+          <button id="sendCodeButton" class="button primary" type="submit">发送 Telegram 验证码</button>
+        </form>
+        <form id="accountVerifyForm" class="account-form" hidden>
+          <p id="accountVerifyHint" class="muted">验证码已发送。</p>
+          <label id="accountCodeLabel">Telegram 验证码<input id="accountCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="12345"></label>
+          <label id="accountPasswordLabel" hidden>两步验证密码<input id="accountPassword" type="password" autocomplete="current-password"></label>
+          <button id="verifyAccountButton" class="button primary" type="submit">完成登录</button>
+        </form>
+      </section>
+
+      <section class="panel groups-panel" aria-label="群管理">
+        <div class="section-head">
+          <div><p class="eyebrow">ALL GROUPS</p><h2>我的群 <span id="groupCount"></span></h2></div>
+          <div class="group-actions">
+            <button id="pauseAllButton" class="button secondary" type="button">全部暂停</button>
+            <button id="addGroupButton" class="button primary" type="button">＋ 添加群</button>
+          </div>
+        </div>
+        <div id="groupCards" class="group-cards"></div>
+        <p id="groupErrors" class="negative" role="status"></p>
+        <p id="selectedGroupInfo" class="muted">选择群后，下方设置和记录仅属于该群。</p>
+      </section>
+      <section id="addGroupPanel" class="panel groups-panel" hidden>
+        <div class="section-head"><h2>添加一个群</h2><button id="cancelAddButton" type="button" class="button ghost">收起</button></div>
+        <form id="addGroupForm" class="add-group-form">
+          <label>账号已加入的群<select id="newGroupId" required><option value="">正在读取群列表…</option></select></label>
+          <label>开奖方式<select id="newGameMode" required>
+            <option value="scheduled">定时开盘（机器人先发期号）</option>
+            <option value="instant_dice">下注后掷骰（先下注，机器人再投骰子）</option>
+          </select></label>
+          <label>即时下一单间隔（秒）<input id="newInstantInterval" type="number" min="1" max="3600" step="1" value="5" required></label>
+          <label for="newBotId">游戏机器人 @用户名<input id="newBotId" type="text" required placeholder="粘贴 @example_bot，也支持数字 ID" autocomplete="off" spellcheck="false"></label>
+          <div id="botCandidates" class="muted">可识别定时开盘消息或 Telegram 原生骰子机器人。</div>
+          <label>最小金额 X<input id="newMin" type="number" min="1" step="1" value="10" required></label>
+          <label>最大金额 Y<input id="newMax" type="number" min="1" step="1" value="20" required></label>
+          <label>流水停止目标 N<input id="newTarget" type="number" min="0.01" step="0.01" value="1000" required></label>
+          <fieldset class="side-fieldset add-side-fieldset">
+            <legend>下注选项（可多选）</legend>
+            <div class="side-picker">
+              <label class="side-option"><input type="checkbox" name="newBetSide" value="大" checked><span>大</span></label>
+              <label class="side-option"><input type="checkbox" name="newBetSide" value="小"><span>小</span></label>
+              <label class="side-option"><input type="checkbox" name="newBetSide" value="单"><span>单</span></label>
+              <label class="side-option"><input type="checkbox" name="newBetSide" value="双"><span>双</span></label>
+            </div>
+            <small>随机金额按每个选项计算，例如“大＋单”、单项 10，本期总流水为 20。</small>
+          </fieldset>
+          <p class="muted">新增群先暂停。所有群使用页面顶部显示的运行模式；添加后可单独恢复下注。</p>
+          <button id="submitAddButton" class="button primary" type="submit">保存并添加</button>
+        </form>
+      </section>
+      <section class="hero-grid" aria-label="运行概览">
+        <article class="panel status-card">
+          <div class="panel-head">
+            <span>当前群运行状态</span>
+            <span id="groupName" class="muted">—</span>
+          </div>
+          <div class="status-main">
+            <span id="statusLight" class="status-light"></span>
+            <div>
+              <strong id="runStatus">正在连接</strong>
+              <small id="statusDetail">等待首次数据</small>
+            </div>
+          </div>
+          <div class="status-actions">
+            <button id="pauseButton" class="button secondary" type="button">暂停此群</button>
+            <button id="resumeButton" class="button primary" type="button">恢复此群</button>
+          </div>
+        </article>
+
+        <article class="panel turnover-card">
+          <div class="panel-head"><span>本轮流水进度</span><span id="turnoverPercent">0%</span></div>
+          <div class="metric-line">
+            <strong id="turnoverValue">0</strong>
+            <span>/ <b id="turnoverTarget">0</b></span>
+          </div>
+          <div class="progress-track" aria-label="流水进度"><span id="turnoverBar"></span></div>
+          <small>只累计成功下注；达到目标后自动暂停</small>
+          <p id="turnoverResetInfo" class="muted">历史记录保留</p>
+        </article>
+
+        <article class="panel latest-card">
+          <div class="panel-head"><span>最新一局</span><span id="latestIssue" class="mono">暂无</span></div>
+          <div class="latest-result">
+            <strong id="latestOutcome">等待数据</strong>
+            <span id="latestCommand" class="command-pill">—</span>
+          </div>
+          <div class="latest-meta">
+            <span>骰子 <b id="latestDice">—</b></span>
+            <span>余额 <b id="latestBalance">—</b></span>
+            <span>净额 <b id="latestNet">—</b></span>
+          </div>
+        </article>
+      </section>
+
+      <section class="kpi-grid" aria-label="统计数据">
+        <article class="kpi"><span>已结算</span><strong id="settledCount">0</strong></article>
+        <article class="kpi"><span>中了</span><strong id="winCount" class="positive">0</strong></article>
+        <article class="kpi"><span>未中</span><strong id="lossCount" class="negative">0</strong></article>
+        <article class="kpi"><span>持平</span><strong id="tieCount" class="neutral">0</strong></article>
+        <article class="kpi"><span>命中率</span><strong id="hitRate">0%</strong></article>
+        <article class="kpi"><span>累计净额</span><strong id="totalNet">0</strong></article>
+        <article class="kpi"><span>最近余额</span><strong id="currentBalance">—</strong></article>
+      </section>
+
+      <section class="workspace-grid">
+        <article class="panel records-panel">
+          <div class="section-head">
+            <div><p class="eyebrow">ROUND HISTORY</p><h2>下注记录</h2></div>
+            <button id="exportButton" class="button ghost" type="button">导出 CSV</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>期号</th><th>指令</th><th>状态</th><th>结果</th><th>流水</th><th>余额</th><th>时间</th></tr></thead>
+              <tbody id="roundsBody"><tr><td colspan="7" class="empty">等待下注记录</td></tr></tbody>
+            </table>
+          </div>
+        </article>
+
+        <aside class="panel controls-panel">
+          <div class="section-head"><div><p class="eyebrow">CONTROLS</p><h2>控制设置</h2></div></div>
+          <form id="modeForm" class="control-form">
+            <div class="mode-row">
+              <label for="gameMode">开奖方式<select id="gameMode" required>
+                <option value="scheduled">定时开盘</option>
+                <option value="instant_dice">下注后掷骰</option>
+              </select></label>
+              <label for="instantInterval">下一单间隔（秒）<input id="instantInterval" type="number" min="1" max="3600" step="1" required></label>
+            </div>
+            <small id="gameModeHelp" class="muted">定时开盘：等待机器人公布新期号后下注。</small>
+            <button id="saveModeButton" class="button primary full" type="submit">保存开奖方式和间隔</button>
+          </form>
+          <form id="amountForm" class="control-form">
+            <label>每个选项的随机金额</label>
+            <div class="input-row">
+              <input id="minAmount" name="minAmount" type="number" min="1" step="1" required aria-label="最小金额">
+              <span>至</span>
+              <input id="maxAmount" name="maxAmount" type="number" min="1" step="1" required aria-label="最大金额">
+            </div>
+            <button class="button primary full" type="submit">保存金额范围</button>
+          </form>
+          <form id="sidesForm" class="control-form">
+            <label>下注选项（可多选）</label>
+            <div id="sidePicker" class="side-picker">
+              <label class="side-option"><input type="checkbox" name="betSide" value="大"><span>大</span></label>
+              <label class="side-option"><input type="checkbox" name="betSide" value="小"><span>小</span></label>
+              <label class="side-option"><input type="checkbox" name="betSide" value="单"><span>单</span></label>
+              <label class="side-option"><input type="checkbox" name="betSide" value="双"><span>双</span></label>
+            </div>
+            <small id="stakePreview" class="muted">至少选择一项</small>
+            <button class="button primary full" type="submit">保存下注选项</button>
+          </form>
+          <form id="targetForm" class="control-form">
+            <label for="targetInput">本轮流水停止目标</label>
+            <input id="targetInput" type="number" min="0.01" step="0.01" required>
+            <button class="button primary full" type="submit">保存流水目标</button>
+            <button id="resetTurnoverButton" class="button secondary full" type="button">流水归零并设置新目标</button>
+            <small class="muted">按上方目标开始新一轮，保留历史记录。重置后点击“恢复下注”。</small>
+          </form>
+          <div class="danger-zone">
+            <span>停止程序会断开 Telegram 并关闭本地网页。</span>
+            <button id="stopButton" class="button danger full" type="button">停止整个程序</button>
+          </div>
+        </aside>
+      </section>
+
+      <section class="panel logs-panel">
+        <div class="section-head">
+          <div><p class="eyebrow">EVENT STREAM</p><h2>实时日志</h2></div>
+          <span id="lastUpdated" class="muted">—</span>
+        </div>
+        <div id="logList" class="log-list"><div class="empty">等待日志</div></div>
+      </section>
+    </main>
+  </div>
+  <div class="dino-ground" aria-hidden="true"><span>· · ·</span><b>🦕</b></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
