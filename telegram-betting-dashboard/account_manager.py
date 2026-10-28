@@ -12,7 +12,8 @@ import secrets
 import shutil
 from dataclasses import dataclass
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 
 from multi_group import MultiGroupManager
 
@@ -33,6 +35,8 @@ from multi_group import MultiGroupManager
 API_ID_RE = re.compile(r"(?i)api[\s_-]*id\s*[:=]?\s*(\d{5,})")
 API_HASH_RE = re.compile(r"(?i)api[\s_-]*hash\s*[:=]?\s*([0-9a-f]{32})")
 PHONE_RE = re.compile(r"^\+?\d{6,15}$")
+INVITE_RE = re.compile(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_-]+)")
+REPORT_USERNAME_RE = re.compile(r"^@?[A-Za-z][A-Za-z0-9_]{4,31}$")
 
 
 class _DataBlob(ctypes.Structure):
@@ -194,6 +198,16 @@ def mask_phone(phone: str | None) -> str:
     return f"***{digits[-4:]}" if len(digits) >= 4 else "***"
 
 
+def next_half_hour(now: datetime | None = None) -> datetime:
+    current = now or datetime.now().astimezone()
+    base = current.replace(second=0, microsecond=0)
+    if current.minute in {0, 30} and current.second == 0 and current.microsecond == 0:
+        return base
+    if current.minute < 30:
+        return base.replace(minute=30)
+    return (base.replace(minute=0) + timedelta(hours=1))
+
+
 @dataclass
 class AccountContext:
     account_id: str
@@ -227,6 +241,8 @@ class AccountRegistry:
         default_username: str | None = None,
         default_phone: str | None = None,
         default_user_id: int | None = None,
+        report_sender_username: str = "@aghaststar",
+        report_chat_selector: str = "https://t.me/+_6dhl6VYwjwxZWU9",
     ):
         self.runner_factory = runner_factory
         self.store_factory = store_factory
@@ -240,6 +256,29 @@ class AccountRegistry:
         self.shared_api_id = int(shared_api_id)
         self.shared_api_hash = str(shared_api_hash)
         self.lock = asyncio.Lock()
+        self.shutdown_event = asyncio.Event()
+        self.watchdog_task: asyncio.Task[None] | None = None
+        self.watchdog_interval = 180
+        self.last_watchdog_at: str | None = None
+        self.report_task: asyncio.Task[None] | None = None
+        self.settings_store = base_manager.control_store
+        self.report_enabled = self.settings_store.setting(
+            "half_hour_report_enabled", "1"
+        ) == "1"
+        self.report_include_details = self.settings_store.setting(
+            "half_hour_report_include_details", "0"
+        ) == "1"
+        self.report_sender_username = self.settings_store.setting(
+            "half_hour_report_sender", str(report_sender_username)
+        ).strip().lstrip("@")
+        self.report_chat_selector = self.settings_store.setting(
+            "half_hour_report_chat", str(report_chat_selector)
+        ).strip()
+        self.last_report_at: str | None = None
+        self.next_report_at: str | None = None
+        self.report_status = "等待下一个整点或半点"
+        self.report_target_cache: dict[str, Any] = {}
+        self.report_lock = asyncio.Lock()
         self.pending: dict[str, dict[str, Any]] = {}
         self.accounts: dict[str, AccountContext] = {
             "default": AccountContext(
@@ -370,7 +409,277 @@ class AccountRegistry:
                     "can_delete": account.can_delete,
                 }
             )
-        return {"accounts": payload, "mode": "live" if self.live else "simulation"}
+        return {
+            "accounts": payload,
+            "mode": "live" if self.live else "simulation",
+            "watchdog_interval": self.watchdog_interval,
+            "last_watchdog_at": self.last_watchdog_at,
+            "report_sender_username": self.report_sender_username,
+            "report_chat_selector": self.report_chat_selector,
+            "report_enabled": self.report_enabled,
+            "report_include_details": self.report_include_details,
+            "last_report_at": self.last_report_at,
+            "next_report_at": self.next_report_at,
+            "report_status": self.report_status,
+        }
+
+    def reporting_account(self) -> AccountContext | None:
+        wanted = self.report_sender_username.lower()
+        return next(
+            (
+                account for account in self.accounts.values()
+                if (account.username or "").lower().lstrip("@") == wanted
+                and account.client is not None
+            ),
+            None,
+        )
+
+    async def resolve_report_target(self, account: AccountContext):
+        cached = self.report_target_cache.get(account.account_id)
+        if cached is not None:
+            return cached
+        selector = self.report_chat_selector
+        match = INVITE_RE.search(selector)
+        if match:
+            invite_hash = match.group(1)
+            checked = await asyncio.wait_for(
+                account.client(CheckChatInviteRequest(invite_hash)), 25
+            )
+            target = getattr(checked, "chat", None)
+            if target is None:
+                joined = await asyncio.wait_for(
+                    account.client(ImportChatInviteRequest(invite_hash)), 30
+                )
+                chats = getattr(joined, "chats", None) or []
+                if not chats:
+                    raise RuntimeError("汇报账号尚未成功加入目标群")
+                target = chats[0]
+        else:
+            key: Any = int(selector) if selector.lstrip("-").isdigit() else selector
+            target = await asyncio.wait_for(account.client.get_entity(key), 25)
+        self.report_target_cache[account.account_id] = target
+        return target
+
+    async def build_half_hour_report(self) -> list[str]:
+        now = datetime.now().astimezone()
+        group_rows: list[tuple[AccountContext, dict[str, Any]]] = []
+        for account in self.accounts.values():
+            if account.manager is None:
+                continue
+            for runner in account.manager.runners.values():
+                group_rows.append((account, await runner.dashboard_state()))
+
+        known_balance = Decimal("0")
+        known_balance_groups = 0
+        turnover = Decimal("0")
+        targets = Decimal("0")
+        lifetime = Decimal("0")
+        settled = wins = losses = ties = pending = 0
+        running = paused = reached = 0
+        for _, state in group_rows:
+            balance_value = state.get("current_balance")
+            if balance_value is None:
+                balance_value = (state.get("latest") or {}).get("balance")
+            if balance_value is not None:
+                known_balance += Decimal(str(balance_value))
+                known_balance_groups += 1
+            turnover += Decimal(str(state.get("turnover") or 0))
+            targets += Decimal(str(state.get("target_turnover") or 0))
+            lifetime += Decimal(str(state.get("lifetime_turnover") or 0))
+            summary = state.get("summary") or {}
+            settled += int(summary.get("settled") or 0)
+            wins += int(summary.get("wins") or 0)
+            losses += int(summary.get("losses") or 0)
+            ties += int(summary.get("ties") or 0)
+            pending += sum(
+                row.get("status") in {
+                    "sending", "sent", "ack_timeout", "result_timeout"
+                }
+                for row in state.get("rounds") or []
+            )
+            if state.get("turnover_reached"):
+                reached += 1
+            elif state.get("paused"):
+                paused += 1
+            else:
+                running += 1
+
+        connected = sum(account.status == "connected" for account in self.accounts.values())
+        lines = [
+            f"📊 半小时整体数据汇报 · {now:%Y-%m-%d %H:%M}",
+            f"账号：{connected}/{len(self.accounts)} 已连接｜群：{len(group_rows)} 个",
+            f"群状态：运行 {running}｜暂停/等待 {paused}｜达到目标 {reached}",
+            f"本轮流水：{turnover} / {targets}｜历史流水：{lifetime}",
+            (
+                f"已知群余额合计：{known_balance}（{known_balance_groups} 个群有余额数据）"
+                if known_balance_groups else "已知群余额合计：暂无机器人余额数据"
+            ),
+            f"已结算：{settled}｜中 {wins}｜未中 {losses}｜持平 {ties}｜待确认 {pending}",
+        ]
+        if self.report_include_details:
+            lines.extend(["", "各群明细："])
+            for account, state in group_rows:
+                status = (
+                    "达标" if state.get("turnover_reached")
+                    else "暂停" if state.get("paused") else "运行"
+                )
+                balance = state.get("current_balance")
+                if balance is None:
+                    balance = (state.get("latest") or {}).get("balance")
+                summary = state.get("summary") or {}
+                lines.append(
+                    f"• {account.label} / {state['group_name']}｜{status}｜"
+                    f"余额 {balance if balance is not None else '未知'}｜"
+                    f"流水 {state.get('turnover', 0)}/{state.get('target_turnover', 0)}｜"
+                    f"结算 {summary.get('settled', 0)} 局｜净额 {summary.get('total_net', 0)}"
+                )
+            if not group_rows:
+                lines.append("• 当前没有已配置群")
+
+        chunks: list[str] = []
+        current = ""
+        for line in lines:
+            candidate = line if not current else current + "\n" + line
+            if len(candidate) > 3500 and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async def send_half_hour_report(self) -> bool:
+        async with self.report_lock:
+            return await self._send_half_hour_report_locked()
+
+    async def _send_half_hour_report_locked(self) -> bool:
+        account = self.reporting_account()
+        if account is None:
+            self.report_status = f"未找到已登录账号 @{self.report_sender_username}"
+            return False
+        try:
+            if hasattr(account.client, "is_connected") and not account.client.is_connected():
+                await asyncio.wait_for(account.client.connect(), 25)
+            target = await self.resolve_report_target(account)
+            chunks = await self.build_half_hour_report()
+            for chunk in chunks:
+                await asyncio.wait_for(account.client.send_message(target, chunk), 30)
+            self.last_report_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            self.report_status = f"已通过 @{self.report_sender_username} 汇报成功"
+            if account.manager is not None:
+                account.manager.control_store.log_event(
+                    "half_hour_report", text=self.report_status
+                )
+            return True
+        except Exception as exc:
+            self.report_status = f"汇报失败，将在下个时段重试：{type(exc).__name__}: {exc}"
+            if account.manager is not None:
+                account.manager.control_store.log_event(
+                    "half_hour_report_error", text=self.report_status
+                )
+            return False
+
+    def start_half_hour_reporter(self) -> None:
+        if self.report_task and not self.report_task.done():
+            return
+        if not self.report_enabled:
+            self.report_status = "定时汇报已关闭"
+            self.next_report_at = None
+            return
+        if self.reporting_account() is None:
+            self.report_status = f"未找到已登录账号 @{self.report_sender_username}"
+
+        async def loop() -> None:
+            while True:
+                scheduled = next_half_hour()
+                self.next_report_at = scheduled.isoformat(timespec="seconds")
+                delay = max(0.1, (scheduled - datetime.now().astimezone()).total_seconds())
+                await asyncio.sleep(delay)
+                if self.report_enabled:
+                    await self.send_half_hour_report()
+
+        self.report_task = asyncio.create_task(loop(), name="half-hour-summary-reporter")
+
+    async def stop_half_hour_reporter(self) -> None:
+        task = self.report_task
+        self.report_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def save_report_settings(self, payload: dict[str, Any]) -> None:
+        enabled = bool(payload.get("report_enabled"))
+        include_details = bool(payload.get("report_include_details"))
+        sender = str(payload.get("report_sender_username") or "").strip()
+        target = str(payload.get("report_chat_selector") or "").strip()
+        if not REPORT_USERNAME_RE.fullmatch(sender):
+            raise ValueError("请选择一个带 @用户名的已登录 Telegram 账号")
+        if not (
+            INVITE_RE.search(target)
+            or REPORT_USERNAME_RE.fullmatch(target)
+            or target.lstrip("-").isdigit()
+        ):
+            raise ValueError("目标群必须填写邀请链接、@用户名或数字群 ID")
+        self.report_enabled = enabled
+        self.report_include_details = include_details
+        self.report_sender_username = sender.lstrip("@")
+        self.report_chat_selector = target
+        self.report_target_cache.clear()
+        self.settings_store.save_setting(
+            "half_hour_report_enabled", "1" if enabled else "0"
+        )
+        self.settings_store.save_setting(
+            "half_hour_report_include_details", "1" if include_details else "0"
+        )
+        self.settings_store.save_setting(
+            "half_hour_report_sender", self.report_sender_username
+        )
+        self.settings_store.save_setting("half_hour_report_chat", target)
+        await self.stop_half_hour_reporter()
+        if enabled:
+            self.report_status = "设置已保存，等待下一个整点或半点"
+            self.start_half_hour_reporter()
+        else:
+            self.report_status = "定时汇报已关闭"
+            self.next_report_at = None
+
+    async def watchdog_once(self) -> None:
+        self.last_watchdog_at = datetime.now().astimezone().isoformat(timespec="seconds")
+
+        async def check(account: AccountContext) -> None:
+            if account.manager is None:
+                return
+            try:
+                if account.client is not None and hasattr(account.client, "is_connected"):
+                    if not account.client.is_connected():
+                        await asyncio.wait_for(account.client.connect(), 25)
+                await account.manager.watchdog_once()
+                account.status = "connected"
+                account.error = None
+            except Exception as exc:
+                account.status = "error"
+                account.error = f"自动检查失败，将重试：{type(exc).__name__}"
+
+        await asyncio.gather(*(check(account) for account in self.accounts.values()))
+
+    def start_watchdog(self) -> None:
+        if self.watchdog_task and not self.watchdog_task.done():
+            return
+
+        async def loop() -> None:
+            while True:
+                await asyncio.sleep(self.watchdog_interval)
+                await self.watchdog_once()
+
+        self.watchdog_task = asyncio.create_task(loop(), name="all-groups-watchdog")
+
+    async def stop_watchdog(self) -> None:
+        task = self.watchdog_task
+        self.watchdog_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def dashboard_action(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "begin_add_account":
@@ -381,14 +690,22 @@ class AccountRegistry:
             return await self.cancel_add_account(payload)
         if action == "remove_account":
             return await self.remove_account(payload)
+        if action == "save_report_settings":
+            await self.save_report_settings(payload)
+            return await self.dashboard_state()
+        if action == "send_report_now":
+            if not await self.send_half_hour_report():
+                raise ValueError(self.report_status)
+            return await self.dashboard_state()
         if action == "stop":
             for account in self.accounts.values():
                 if account.manager:
                     for runner in account.manager.runners.values():
-                        runner.paused = True
-                        runner.cancel_scheduled_instant_round()
+                        runner.set_run_requested(False)
+                        runner.automatic_pause("manual")
                         account.manager.save_settings(runner)
             loop = asyncio.get_running_loop()
+            self.shutdown_event.set()
             loop.call_later(0.3, lambda: asyncio.create_task(self.disconnect_all()))
             return await self.dashboard_state()
 
@@ -400,7 +717,14 @@ class AccountRegistry:
             raise ValueError(account.error or "该账号当前未连接")
         result = await account.manager.dashboard_action(action, payload)
         state = await self.dashboard_state()
-        for key in ("available_groups", "bot_candidates"):
+        # Keep the selected account's group list at the top level for action
+        # responses too.  Older dashboard pages still read ``data.groups``
+        # after clicking "添加群", while the normal multi-account state keeps
+        # groups inside ``data.accounts``.
+        for key in (
+            "groups", "available_groups", "bot_candidates",
+            "removed_group_id", "archived_group_path",
+        ):
             if key in result:
                 state[key] = result[key]
         return state
@@ -592,6 +916,8 @@ class AccountRegistry:
         return state
 
     async def close(self) -> None:
+        await self.stop_half_hour_reporter()
+        await self.stop_watchdog()
         for token in list(self.pending):
             await self._discard_pending(token)
         for account in self.accounts.values():
@@ -599,6 +925,9 @@ class AccountRegistry:
                 await account.manager.close()
             if account.client is not None and account.account_id != "default":
                 await account.client.disconnect()
+
+    async def wait_until_shutdown(self) -> None:
+        await self.shutdown_event.wait()
 
     async def disconnect_all(self) -> None:
         await asyncio.gather(
