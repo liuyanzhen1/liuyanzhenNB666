@@ -10,6 +10,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import webbrowser
 from collections import Counter
 from dataclasses import dataclass
@@ -23,8 +24,10 @@ from telethon import TelegramClient, events, utils
 from account_manager import AccountRegistry
 from dashboard import DashboardServer
 from multi_group import MultiGroupManager
+from recovery import RecoveryMixin
 from parsers import (
     is_big,
+    normalize_bet_delivery,
     normalize_bet_sides,
     normalize_game_mode,
     parse_ack,
@@ -138,6 +141,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS rounds (
                 issue TEXT PRIMARY KEY,
                 game_mode TEXT NOT NULL DEFAULT 'scheduled',
+                bet_delivery TEXT NOT NULL DEFAULT 'group',
                 opened_at TEXT,
                 open_message_id INTEGER,
                 bet_side TEXT NOT NULL DEFAULT '大',
@@ -194,6 +198,10 @@ class Store:
         if "game_mode" not in columns:
             self.conn.execute(
                 "ALTER TABLE rounds ADD COLUMN game_mode TEXT NOT NULL DEFAULT 'scheduled'"
+            )
+        if "bet_delivery" not in columns:
+            self.conn.execute(
+                "ALTER TABLE rounds ADD COLUMN bet_delivery TEXT NOT NULL DEFAULT 'group'"
             )
         self.conn.execute("UPDATE rounds SET unit_amount=bet_amount WHERE unit_amount IS NULL AND bet_amount IS NOT NULL")
         self.conn.commit()
@@ -396,7 +404,7 @@ class Store:
             writer.writerows(tuple(row) for row in rows)
 
 
-class BigBetRunner:
+class BigBetRunner(RecoveryMixin):
     def __init__(
         self,
         client: TelegramClient,
@@ -416,6 +424,7 @@ class BigBetRunner:
         bet_sides: Any = None,
         game_mode: str | None = None,
         instant_interval: int | None = None,
+        bet_delivery: str | None = None,
     ):
         self.client = client
         self.group = group
@@ -439,13 +448,17 @@ class BigBetRunner:
         self.instant_interval = instant_interval_seconds(
             store.setting("instant_interval") or instant_interval or 5
         )
+        self.bet_delivery = normalize_bet_delivery(
+            store.setting("bet_delivery") or bet_delivery or "group"
+        )
         self.paused = False
         self.turnover_reached = False
         self.lock = asyncio.Lock()
         self.timeout_tasks: dict[str, asyncio.Task[None]] = {}
         self.instant_next_task: asyncio.Task[None] | None = None
         self.instant_result_timeout = max(30, self.ack_timeout * 3)
-        pending = self.store.latest_unsettled_instant()
+        self.initialize_recovery()
+        pending = self.unresolved_instant()
         self.instant_active_issue = pending["issue"] if pending else None
         for existing_round in self.store.all_rounds():
             self.write_round_report(existing_round["issue"])
@@ -463,6 +476,7 @@ class BigBetRunner:
             "rejected": "下注未接受",
             "ack_timeout": "回执超时",
             "result_timeout": "开奖超时",
+            "abandoned": "失联订单已跳过",
             "send_error": "发送失败",
             "dry_run": "模拟下注",
             "skipped_paused": "暂停，未下注",
@@ -488,6 +502,7 @@ class BigBetRunner:
         lines = [
             f"群：{self.group_name} ({self.group_id})",
             f"开奖方式：{'下注后掷骰' if row['game_mode'] == 'instant_dice' else '定时开盘'}",
+            f"下注发送：{'机器人私聊' if row['bet_delivery'] == 'private_bot' else '当前群内'}",
             f"期号：{row['issue']}",
             f"发送：{row['command'] or '未发送'}",
             f"下注选项：{row['bet_side'] or '未知'}",
@@ -530,6 +545,19 @@ class BigBetRunner:
             return
         text = event.raw_text or ""
         message_id = event.message.id
+        is_group_message = getattr(event, "chat_id", self.group_id) == self.group_id
+
+        # Private chats are used only for the reply/dice belonging to an order.
+        # Opening, closing and result announcements must still come from the group.
+        if not is_group_message:
+            dice = telegram_dice_value(event.message)
+            if self.game_mode == "instant_dice" and dice is not None:
+                await self.handle_instant_dice(event, dice)
+                return
+            ack = parse_ack(text)
+            if ack:
+                await self.handle_ack(event, ack, text)
+            return
 
         if self.game_mode == "instant_dice":
             dice = telegram_dice_value(event.message)
@@ -556,6 +584,7 @@ class BigBetRunner:
                 "closed", issue=close_issue, message_id=message_id, sender_id=event.sender_id
             )
             self.write_round_report(close_issue)
+            self.resume_after_recovery()
             print(f"\n[封盘] {close_issue}")
             return
 
@@ -570,9 +599,15 @@ class BigBetRunner:
 
     async def handle_open(self, issue: str, message_id: int, text: str) -> None:
         async with self.lock:
+            self.last_observed_open_message_id = max(
+                self.last_observed_open_message_id, message_id
+            )
+            if self.paused and self.run_requested and not self.turnover_reached:
+                self.resume_after_recovery()
             inserted = self.store.ensure_round(
                 issue,
                 game_mode="scheduled",
+                bet_delivery=self.bet_delivery,
                 opened_at=now_iso(),
                 open_message_id=message_id,
                 raw_open=f"期号:{issue}",
@@ -617,6 +652,7 @@ class BigBetRunner:
 
             if not self.live:
                 self.store.update(issue, send_status="dry_run")
+                self.last_bet_activity_at = time.monotonic()
                 print(f"\n[模拟] {issue} 将发送：{command}")
                 self.pause_if_turnover_reached()
                 self.store.update(issue, turnover_after_bet=str(self.store.total_turnover(self.live)))
@@ -625,9 +661,9 @@ class BigBetRunner:
 
             self.store.update(issue, send_status="sending")
             try:
-                sent = await self.client.send_message(self.group, command)
+                sent = await asyncio.wait_for(self.send_bet_message(command), 30)
             except Exception as exc:
-                self.paused = True
+                self.automatic_pause("send_error")
                 self.store.update(issue, send_status="send_error", note=repr(exc))
                 self.store.log_event("send_error", issue=issue, text=repr(exc))
                 self.write_round_report(issue)
@@ -641,6 +677,7 @@ class BigBetRunner:
                 sent_message_id=sent.id,
                 sent_at=now_iso(),
             )
+            self.last_bet_activity_at = time.monotonic()
             self.store.log_event(
                 "sent", issue=issue, message_id=sent.id, text=command
             )
@@ -657,6 +694,14 @@ class BigBetRunner:
         stamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S")
         return f"IN{stamp}-{sequence:06d}"
 
+    async def send_bet_message(self, command: str):
+        target = self.group
+        if self.bet_delivery == "private_bot":
+            # Resolve the bot before sending so Telethon has the correct access
+            # hash even when this account has only seen the bot inside a group.
+            target = await self.client.get_entity(self.bot_id)
+        return await self.client.send_message(target, command)
+
     async def start_instant_round(self) -> None:
         if self.game_mode != "instant_dice":
             return
@@ -669,8 +714,9 @@ class BigBetRunner:
         if self.instant_active_issue:
             row = self.store.get(self.instant_active_issue)
             if row and row["dice"] is None and row["send_status"] in {
-                "sending", "sent", "accepted"
+                "sending", "sent", "accepted", "ack_timeout", "result_timeout", "send_error"
             }:
+                self.automatic_pause("unresolved_order")
                 return
             self.instant_active_issue = None
 
@@ -681,6 +727,7 @@ class BigBetRunner:
         self.store.ensure_round(
             issue,
             game_mode="instant_dice",
+            bet_delivery=self.bet_delivery,
             opened_at=now_iso(),
             raw_open="即时模式：主动下注后等待机器人掷骰",
             bet_side=",".join(self.bet_sides),
@@ -713,11 +760,9 @@ class BigBetRunner:
         self.instant_active_issue = issue
         self.store.update(issue, send_status="sending")
         try:
-            sent = await self.client.send_message(self.group, command)
+            sent = await asyncio.wait_for(self.send_bet_message(command), 30)
         except Exception as exc:
-            self.instant_active_issue = None
-            self.paused = True
-            self.store.save_setting(f"paused_{int(self.live)}", "1")
+            self.automatic_pause("send_error")
             self.store.update(issue, send_status="send_error", note=repr(exc))
             self.store.log_event("send_error", issue=issue, text=repr(exc))
             self.write_round_report(issue)
@@ -726,12 +771,14 @@ class BigBetRunner:
 
         current = self.store.get(issue)
         already_settled = current is not None and current["dice"] is not None
+        preserved_status = current["send_status"] if current is not None else None
         self.store.update(
             issue,
-            **({} if already_settled else {"send_status": "sent"}),
+            **({} if already_settled or preserved_status in {"accepted", "rejected"} else {"send_status": "sent"}),
             sent_message_id=sent.id,
             sent_at=now_iso(),
         )
+        self.last_bet_activity_at = time.monotonic()
         self.store.log_event("sent", issue=issue, message_id=sent.id, text=command)
         self.write_round_report(issue)
         if already_settled:
@@ -754,11 +801,14 @@ class BigBetRunner:
         async def run_next() -> None:
             try:
                 await asyncio.sleep(self.instant_interval)
+                if self.instant_next_task is asyncio.current_task():
+                    self.instant_next_task = None
+                self.next_instant_due_at = None
                 await self.start_instant_round()
             finally:
                 if self.instant_next_task is asyncio.current_task():
                     self.instant_next_task = None
-
+        self.next_instant_due_at = time.monotonic() + self.instant_interval
         self.instant_next_task = asyncio.create_task(run_next())
 
     async def watch_instant_result(self, issue: str) -> None:
@@ -769,21 +819,23 @@ class BigBetRunner:
         row = self.store.get(issue)
         if not row or row["dice"] is not None:
             return
-        self.paused = True
-        self.store.save_setting(f"paused_{int(self.live)}", "1")
-        if self.instant_active_issue == issue:
-            self.instant_active_issue = None
+        self.automatic_pause("result_timeout")
         values: dict[str, Any] = {
             "result_at": now_iso(),
             "outcome": "unknown",
-            "note": f"{self.instant_result_timeout} 秒内未收到这一单的机器人骰子，已自动暂停；请先核对群消息",
+            "note": f"{self.instant_result_timeout} 秒内未收到这一单的机器人骰子，正在自动回查",
         }
         if row["send_status"] in {"sending", "sent"}:
             values["send_status"] = "result_timeout"
         self.store.update(issue, **values)
         self.store.log_event("result_timeout", issue=issue)
         self.write_round_report(issue)
-        print(f"\n[开奖超时并暂停] {issue}。请先核对群消息再恢复")
+        try:
+            await asyncio.wait_for(self.reconcile_recent_history(), 30)
+        except Exception as exc:
+            self.store.log_event("result_recheck_error", issue=issue, text=type(exc).__name__)
+        self.resume_after_recovery()
+        print(f"\n[开奖超时] {issue}，已回查最近消息；未确认时会继续保留待核对状态")
 
     @staticmethod
     def _reply_message_id(message: Any) -> int | None:
@@ -793,12 +845,14 @@ class BigBetRunner:
             or getattr(message, "reply_to_msg_id", None)
         )
 
-    async def handle_instant_dice(self, event: events.NewMessage.Event, dice: int) -> None:
+    async def handle_instant_dice(self, event: events.NewMessage.Event, dice: int, strict: bool = False) -> None:
         reply_id = self._reply_message_id(event.message)
         row = self.store.by_sent_message(reply_id) if reply_id else None
+        if row is not None and not self.row_matches_event_chat(row, event):
+            row = None
         if row is not None and row["game_mode"] != "instant_dice":
             row = None
-        if row is None and self.instant_active_issue:
+        if row is None and self.instant_active_issue and not strict:
             row = self.store.get(self.instant_active_issue)
         if row is None:
             self.store.log_event(
@@ -813,12 +867,21 @@ class BigBetRunner:
                 "duplicate_result", issue=row["issue"], message_id=event.message.id
             )
             return
+        if row["send_status"] == "abandoned":
+            self.store.log_event(
+                "late_abandoned_result",
+                issue=row["issue"],
+                message_id=event.message.id,
+                sender_id=event.sender_id,
+                text=f"已跳过订单后来收到骰子 {dice}，仅记录不计入当前订单",
+            )
+            return
         if row["send_status"] in {"rejected", "send_error", "skipped_paused", "skipped_target"}:
             return
 
         issue = row["issue"]
         task = self.timeout_tasks.pop(issue, None)
-        if task:
+        if task and task is not asyncio.current_task():
             task.cancel()
         if row["send_status"] != "accepted":
             self.store.update(
@@ -843,45 +906,49 @@ class BigBetRunner:
         await self.handle_result(
             issue, dice, event.message.id, f"即时掷骰：{dice}"
         )
+        self.resume_after_recovery()
         self.schedule_next_instant_round()
 
     async def watch_ack_timeout(self, issue: str) -> None:
         await asyncio.sleep(self.ack_timeout)
         row = self.store.get(issue)
         if row and row["send_status"] == "sent":
-            self.paused = True
-            self.store.save_setting(f"paused_{int(self.live)}", "1")
+            self.automatic_pause("ack_timeout")
             self.store.update(
                 issue,
                 send_status="ack_timeout",
-                note=f"{self.ack_timeout} 秒内未收到可匹配的机器人回执，已自动暂停",
+                note=f"{self.ack_timeout} 秒内未收到可匹配的机器人回执，正在自动回查",
             )
             self.store.log_event("ack_timeout", issue=issue)
             self.write_round_report(issue)
-            print(f"\n[回执超时并暂停] {issue}。请核对群消息后再输入 resume")
+            self.store.log_event("ack_recheck", issue=issue, text="开始回查最近消息")
+            try:
+                await asyncio.wait_for(self.reconcile_recent_history(), 30)
+            except Exception as exc:
+                self.store.log_event("ack_recheck_error", issue=issue, text=type(exc).__name__)
+            self.resume_after_recovery()
+            print(f"\n[回执超时] {issue}，已自动回查；无法确认时保留待核对状态")
 
-    async def handle_ack(self, event: events.NewMessage.Event, ack: Any, text: str) -> None:
-        reply_id = self._reply_message_id(event.message)
-        row = self.store.by_sent_message(reply_id) if reply_id else None
+    async def handle_ack(self, event: events.NewMessage.Event, ack: Any, text: str, strict: bool = False) -> None:
+        row = self.match_ack_row(event, text, strict=strict)
         if row is None:
-            # 某些机器人不会真正引用原消息；只在回执中出现完全相同指令时匹配最近待确认订单。
-            for candidate in self.store.recent(5):
-                command = candidate["command"]
-                if command and command in text and candidate["send_status"] in {
-                    "sending",
-                    "sent",
-                    "ack_timeout",
-                }:
-                    row = candidate
-                    break
-        if row is None:
+            return
+
+        if row["send_status"] == "abandoned":
+            self.store.log_event(
+                "late_abandoned_ack",
+                issue=row["issue"],
+                message_id=event.message.id,
+                sender_id=event.sender_id,
+                text="已跳过订单后来收到回执，仅记录，不改变流水和当前订单",
+            )
             return
 
         issue = row["issue"]
         is_instant = row["game_mode"] == "instant_dice"
         if not is_instant or ack.rejected:
             task = self.timeout_tasks.pop(issue, None)
-            if task:
+            if task and task is not asyncio.current_task():
                 task.cancel()
         if ack.accepted:
             status = "accepted"
@@ -896,8 +963,7 @@ class BigBetRunner:
             note = "机器人拒绝投注或已封盘；本期不会重试"
             print(f"\n[下注未接受] {issue} {row['command']}，本期不重试")
             if is_instant:
-                self.paused = True
-                self.store.save_setting(f"paused_{int(self.live)}", "1")
+                self.automatic_pause("rejected")
                 if self.instant_active_issue == issue:
                     self.instant_active_issue = None
 
@@ -921,13 +987,19 @@ class BigBetRunner:
         if ack.accepted:
             self.pause_if_turnover_reached()
             self.store.update(issue, turnover_after_bet=str(self.store.total_turnover(self.live)))
+            refreshed = self.store.get(issue)
+            if refreshed is not None and refreshed["dice"] is not None and refreshed["outcome"] == "unknown":
+                await self.handle_result(issue, int(refreshed["dice"]), refreshed["result_message_id"] or event.message.id, refreshed["raw_result"] or text)
+        self.resume_after_recovery()
         self.write_round_report(issue)
 
     async def handle_result(self, issue: str, dice: int, message_id: int, text: str) -> None:
         self.store.ensure_round(issue)
         row = self.store.get(issue)
         assert row is not None
-        if row["dice"] is not None:
+        if row["dice"] is not None and not (
+            row["outcome"] == "unknown" and row["send_status"] == "accepted"
+        ):
             self.store.log_event(
                 "duplicate_result", issue=issue, message_id=message_id, text=f"重复骰子 {dice}"
             )
@@ -982,6 +1054,7 @@ class BigBetRunner:
             text=safe_result_text,
         )
         self.write_round_report(issue)
+        self.resume_after_recovery()
         if outcome in {"win", "loss", "tie"}:
             print(
                 f"\n[开奖] {issue} 骰子={dice}({result_side})，"
@@ -997,7 +1070,7 @@ class BigBetRunner:
         if self.current_turnover < self.stop_turnover:
             return False
         self.turnover_reached = True
-        self.paused = True
+        self.automatic_pause("target")
         print(
             f"\n[已达到流水目标] 当前累计流水={self.current_turnover}，"
             f"目标流水={self.stop_turnover}；"
@@ -1054,6 +1127,7 @@ class BigBetRunner:
         return {
             "issue": row["issue"],
             "game_mode": row["game_mode"],
+            "bet_delivery": row["bet_delivery"],
             "command": row["command"],
             "amount": row["bet_amount"],
             "unit_amount": row["unit_amount"],
@@ -1101,6 +1175,10 @@ class BigBetRunner:
             "group_name": self.group_name,
             "group_id": self.group_id,
             "bot_id": self.bot_id,
+            "bet_delivery": self.bet_delivery,
+            "bet_delivery_label": (
+                "机器人私聊" if self.bet_delivery == "private_bot" else "群内发送"
+            ),
             "game_mode": self.game_mode,
             "game_mode_label": "下注后掷骰" if self.game_mode == "instant_dice" else "定时开盘",
             "instant_pending_issue": self.instant_active_issue,
@@ -1110,6 +1188,11 @@ class BigBetRunner:
                 self.instant_next_task and not self.instant_next_task.done()
             ),
             "paused": self.paused,
+            "run_requested": self.run_requested,
+            "pause_reason": self.pause_reason,
+            "watchdog_status": self.watchdog_status,
+            "last_watchdog_at": self.last_watchdog_at,
+            "recovery_count": self.recovery_count,
             "turnover_reached": self.turnover_reached,
             "min_amount": self.min_amount,
             "max_amount": self.max_amount,
@@ -1138,15 +1221,23 @@ class BigBetRunner:
     async def dashboard_action(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         start_instant = False
         if action == "pause":
-            self.paused = True
-            self.cancel_scheduled_instant_round()
+            self.set_run_requested(False)
+            self.automatic_pause("manual")
         elif action == "resume":
             self.current_turnover = self.store.cycle_turnover(self.live)
             if self.current_turnover >= self.stop_turnover:
                 self.turnover_reached = True
                 raise ValueError("累计流水已达到目标，请先提高流水目标")
             self.turnover_reached = False
+            if self.game_mode == "instant_dice" and self.paused:
+                self.abandon_unresolved_instant(
+                    "用户点击恢复，跳过此前一直没有返回骰子的失联订单"
+                )
+            self.set_run_requested(True)
             self.paused = False
+            self.pause_reason = ""
+            self.store.save_setting(f"paused_{int(self.live)}", "0")
+            self.store.save_setting(f"pause_reason_{int(self.live)}", "")
             start_instant = self.game_mode == "instant_dice"
         elif action == "set_amount":
             try:
@@ -1181,6 +1272,14 @@ class BigBetRunner:
             self.store.save_setting("instant_interval", str(self.instant_interval))
             if was_waiting and self.game_mode == "instant_dice":
                 self.schedule_next_instant_round()
+        elif action == "set_delivery":
+            new_delivery = normalize_bet_delivery(payload.get("bet_delivery"))
+            if not self.paused:
+                raise ValueError("请先暂停此群，再修改下注发送位置")
+            if self.instant_active_issue:
+                raise ValueError("上一单仍在等待骰子，暂时不能修改下注发送位置")
+            self.bet_delivery = new_delivery
+            self.store.save_setting("bet_delivery", self.bet_delivery)
         elif action in {"set_target", "reset_turnover"}:
             try:
                 target = positive_decimal(
@@ -1191,8 +1290,8 @@ class BigBetRunner:
             if action == "reset_turnover":
                 async with self.lock:
                     self.store.reset_turnover(self.live, target)
-                    self.paused = True
-                    self.cancel_scheduled_instant_round()
+                    self.set_run_requested(False)
+                    self.automatic_pause("manual")
             else:
                 self.store.save_setting(f"turnover_target_{int(self.live)}", str(target))
             self.stop_turnover = target
@@ -1256,7 +1355,8 @@ class BigBetRunner:
                 except argparse.ArgumentTypeError as exc:
                     print(exc)
             elif command == "pause":
-                self.paused = True
+                self.set_run_requested(False)
+                self.automatic_pause("manual")
                 print("已暂停；仍继续记录群消息和开奖结果")
             elif command == "resume":
                 self.current_turnover = self.store.cycle_turnover(self.live)
@@ -1265,7 +1365,11 @@ class BigBetRunner:
                     print("累计流水仍已达到停止目标；请先用 target 设置更高目标")
                 else:
                     self.turnover_reached = False
+                    self.set_run_requested(True)
                     self.paused = False
+                    self.pause_reason = ""
+                    self.store.save_setting(f"paused_{int(self.live)}", "0")
+                    self.store.save_setting(f"pause_reason_{int(self.live)}", "")
                     print("已恢复；从下一个新期号开始下注，不补投旧期")
             elif command == "history":
                 limit = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10
@@ -1575,8 +1679,14 @@ async def main() -> None:
         default_username=getattr(me, "username", None),
         default_phone=getattr(me, "phone", None),
         default_user_id=int(me.id),
+        report_sender_username=os.getenv("TG_REPORT_ACCOUNT", "@aghaststar"),
+        report_chat_selector=os.getenv(
+            "TG_REPORT_CHAT", "https://t.me/+_6dhl6VYwjwxZWU9"
+        ),
     )
     await accounts.load()
+    accounts.start_watchdog()
+    accounts.start_half_hour_reporter()
     dashboard = DashboardServer(
         accounts,
         asyncio.get_running_loop(),
@@ -1590,7 +1700,7 @@ async def main() -> None:
     print("监听已启动；只处理启动后的新消息，不追投历史期号。")
     print("多群管理已启用；请在网页中切换群、添加群和控制下注。Ctrl+C 可退出。")
     try:
-        await client.run_until_disconnected()
+        await accounts.wait_until_shutdown()
     finally:
         dashboard.stop()
         await accounts.close()
