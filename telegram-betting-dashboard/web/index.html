@@ -32,6 +32,26 @@
         <p id="accountInfo" class="muted">正在读取账号…</p>
       </section>
 
+      <section class="panel report-panel" aria-label="半小时汇报设置">
+        <div class="section-head">
+          <div><p class="eyebrow">HALF-HOUR REPORT</p><h2>半小时汇报设置</h2></div>
+          <span id="reportStatus" class="muted">正在初始化…</span>
+        </div>
+        <form id="reportForm" class="report-form">
+          <div class="report-toggles">
+            <label class="report-toggle"><input id="reportEnabled" type="checkbox"><span>启用整点和半点自动汇报</span></label>
+            <label class="report-toggle"><input id="reportIncludeDetails" type="checkbox"><span>包含各群明细</span></label>
+          </div>
+          <label>发送账号<select id="reportAccountSelect"></select></label>
+          <label>目标群<input id="reportChatInput" type="text" placeholder="邀请链接、@用户名或数字群 ID" autocomplete="off"></label>
+          <div class="report-actions">
+            <button class="button primary" type="submit">保存汇报设置</button>
+            <button id="sendReportNowButton" class="button secondary" type="button">立即汇报</button>
+          </div>
+        </form>
+        <small class="muted">定时点：每天 00 和 30 分。默认只汇报整体数据；勾选“包含各群明细”后才追加逐群内容。立即汇报会使用当前已保存的设置。</small>
+      </section>
+
       <section id="addAccountPanel" class="panel account-add-panel" hidden>
         <div class="section-head"><div><p class="eyebrow">ADD ACCOUNT</p><h2>添加 Telegram 账号</h2></div><button id="cancelAccountButton" class="button ghost" type="button">取消</button></div>
         <form id="accountCredentialsForm" class="account-form">
@@ -68,6 +88,10 @@
             <option value="scheduled">定时开盘（机器人先发期号）</option>
             <option value="instant_dice">下注后掷骰（先下注，机器人再投骰子）</option>
           </select></label>
+          <label>下注发送位置<select id="newBetDelivery" required>
+            <option value="group">当前群内发送</option>
+            <option value="private_bot">机器人私聊发送</option>
+          </select></label>
           <label>即时下一单间隔（秒）<input id="newInstantInterval" type="number" min="1" max="3600" step="1" value="5" required></label>
           <label for="newBotId">游戏机器人 @用户名<input id="newBotId" type="text" required placeholder="粘贴 @example_bot，也支持数字 ID" autocomplete="off" spellcheck="false"></label>
           <div id="botCandidates" class="muted">可识别定时开盘消息或 Telegram 原生骰子机器人。</div>
@@ -99,11 +123,13 @@
             <div>
               <strong id="runStatus">正在连接</strong>
               <small id="statusDetail">等待首次数据</small>
+              <small id="watchdogDetail" class="muted">自动检查：等待首次检查</small>
             </div>
           </div>
           <div class="status-actions">
             <button id="pauseButton" class="button secondary" type="button">暂停此群</button>
             <button id="resumeButton" class="button primary" type="button">恢复此群</button>
+            <button id="deleteGroupButton" class="button danger" type="button">删除此群</button>
           </div>
         </article>
 
@@ -168,6 +194,15 @@
             </div>
             <small id="gameModeHelp" class="muted">定时开盘：等待机器人公布新期号后下注。</small>
             <button id="saveModeButton" class="button primary full" type="submit">保存开奖方式和间隔</button>
+          </form>
+          <form id="deliveryForm" class="control-form">
+            <label for="betDelivery">下注发送位置</label>
+            <select id="betDelivery" required>
+              <option value="group">当前群内发送</option>
+              <option value="private_bot">机器人私聊发送</option>
+            </select>
+            <small id="deliveryHelp" class="muted">群内发送：开盘、下注、开奖都在当前群完成。</small>
+            <button id="saveDeliveryButton" class="button primary full" type="submit">保存下注发送位置</button>
           </form>
           <form id="amountForm" class="control-form">
             <label>每个选项的随机金额</label>
