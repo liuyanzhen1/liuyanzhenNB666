@@ -16,6 +16,7 @@ BALANCE_RE = re.compile(r"余额\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)")
 FROZEN_RE = re.compile(r"冻结\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)")
 BET_SIDE_ORDER = ("大", "小", "单", "双")
 GAME_MODES = ("scheduled", "instant_dice")
+BET_DELIVERIES = ("group", "private_bot")
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,16 @@ def parse_ack(text: str) -> Ack | None:
     )
 
 
+def command_matches(text: str, command: str) -> bool:
+    """Match a complete command without confusing 大10 with 大100."""
+    value = re.sub(r"\s+", " ", normalize(text))
+    expected = re.sub(r"\s+", " ", normalize(command))
+    if not expected:
+        return False
+    pattern = re.escape(expected).replace(r"\ ", r"\s+") + r"(?!\d)"
+    return re.search(pattern, value) is not None
+
+
 def is_big(dice: int) -> bool:
     if dice not in range(1, 7):
         raise ValueError("骰子必须是 1 到 6")
@@ -102,6 +113,13 @@ def normalize_game_mode(value: Any) -> str:
     if mode not in GAME_MODES:
         raise ValueError("开奖方式必须是定时开盘或下注后掷骰")
     return mode
+
+
+def normalize_bet_delivery(value: Any) -> str:
+    delivery = str(value or "group").strip().lower()
+    if delivery not in BET_DELIVERIES:
+        raise ValueError("下注发送位置必须是群内发送或机器人私聊")
+    return delivery
 
 
 def result_sides(dice: int) -> list[str]:
