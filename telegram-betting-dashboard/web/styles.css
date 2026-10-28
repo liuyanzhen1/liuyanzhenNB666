@@ -21,6 +21,16 @@
 .account-select-label { display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
 .account-select-label select { width: 100%; min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); background: var(--bg); }
 #accountInfo { margin-top: 13px; overflow-wrap: anywhere; }
+.report-panel { margin-bottom: 20px; }
+#reportStatus { overflow-wrap: anywhere; font-size: 12px; text-align: right; }
+.report-form { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(220px, 1fr) minmax(300px, 1.5fr) auto; gap: 14px; align-items: end; }
+.report-form label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
+.report-toggles { display: grid; gap: 8px; align-self: center; }
+.report-form input, .report-form select { width: 100%; min-width: 0; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; outline: none; }
+.report-toggle { display: flex !important; flex-direction: row; align-items: center; padding: 11px 0; color: var(--text) !important; }
+.report-toggle input { width: 18px; height: 18px; }
+.report-actions { display: flex; gap: 9px; }
+.report-panel > small { display: block; margin-top: 12px; }
 .account-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
 .account-form label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
 .account-form input, .account-form textarea { width: 100%; min-width: 0; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; outline: none; resize: vertical; }
@@ -85,7 +95,7 @@ h2 { font-size: 19px; }
 .status-light { width: 16px; height: 16px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 8px rgba(255, 200, 97, .08); }
 .status-light.running { background: var(--green); box-shadow: 0 0 0 8px rgba(72, 215, 137, .08); }
 .status-light.paused { background: var(--red); box-shadow: 0 0 0 8px rgba(255, 107, 113, .08); }
-.status-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.status-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
 .button { border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: 750; transition: transform .15s ease, opacity .15s ease, background .15s ease; }
 .button:hover { transform: translateY(-1px); }
 .button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
@@ -170,6 +180,7 @@ tbody tr:hover { background: rgba(60, 224, 208, .035); }
   .latest-card { grid-column: 1 / -1; }
   .kpi-grid { grid-template-columns: repeat(3, 1fr); }
   .workspace-grid { grid-template-columns: minmax(0, 1fr); }
+  .report-form { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 680px) {
   .shell { width: min(100% - 22px, 1500px); padding-top: 18px; }
@@ -183,5 +194,8 @@ tbody tr:hover { background: rgba(60, 224, 208, .035); }
   .log-entry { grid-template-columns: 1fr; gap: 3px; }
   .mode-row { grid-template-columns: 1fr; }
   .account-switcher, .account-form { grid-template-columns: 1fr; }
+  .report-form { grid-template-columns: 1fr; }
+  #reportStatus { text-align: left; }
+  .status-actions { grid-template-columns: 1fr; }
   .account-form > small, .account-form > p { grid-column: auto; }
 }
