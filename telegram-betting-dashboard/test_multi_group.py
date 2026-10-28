@@ -65,7 +65,8 @@ class MultiGroupTests(unittest.IsolatedAsyncioTestCase):
             await self.manager.dashboard_action("add_group", {"group_id": gid, "bot_id": value,
                 "min_amount": 10, "max_amount": 20, "target_turnover": "100",
                 "game_mode": "instant_dice" if gid == -2 else "scheduled",
-                "instant_interval": 12 if gid == -2 else 5})
+                "instant_interval": 12 if gid == -2 else 5,
+                "bet_delivery": "private_bot" if gid == -2 else "group"})
             self.assertEqual(self.manager.runners[gid].bot_id, 99)
             self.assertTrue(self.manager.runners[gid].paused)
         profiles = json.loads(self.manager.primary.store.setting("group_profiles_v1"))
@@ -76,6 +77,7 @@ class MultiGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.runners[-2].bot_id, 99)
         self.assertEqual(self.manager.runners[-2].game_mode, "instant_dice")
         self.assertEqual(self.manager.runners[-2].instant_interval, 12)
+        self.assertEqual(self.manager.runners[-2].bet_delivery, "private_bot")
         self.client.send_message.assert_not_awaited()
 
     async def test_bad_username_and_non_bot_do_not_add_group(self):
@@ -131,6 +133,18 @@ class MultiGroupTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.dashboard_action("pause_all", {})
         self.assertTrue(all(r.paused for r in self.manager.runners.values()))
 
+    async def test_watchdog_checks_and_recovers_every_running_group(self):
+        await self.add()
+        await self.manager.dashboard_action("resume", {"group_id": -2})
+        for runner in self.manager.runners.values():
+            runner.set_run_requested(True)
+            runner.automatic_pause("group_error")
+            runner.last_bet_activity_at = 0
+        results = await self.manager.watchdog_once(now=181)
+        self.assertEqual(results, [True, True])
+        self.assertTrue(all(not runner.paused for runner in self.manager.runners.values()))
+        self.assertTrue(all(runner.recovery_count == 1 for runner in self.manager.runners.values()))
+
     async def test_routing_ignores_other_groups_and_senders(self):
         await self.add()
         one, two = self.manager.runners.values()
@@ -144,6 +158,37 @@ class MultiGroupTests(unittest.IsolatedAsyncioTestCase):
         # Exercise the actual sender filter separately.
         await BigBetRunner.handle_message(two, self.event(-2, sender=100))
         self.assertEqual(two.store.all_rounds(), [])
+
+    async def test_private_bot_messages_route_to_group_configured_for_private_bets(self):
+        await self.manager.dashboard_action("add_group", {
+            "group_id": -2, "bot_id": 99, "min_amount": 20,
+            "max_amount": 20, "target_turnover": "200",
+            "bet_delivery": "private_bot",
+        })
+        one, two = self.manager.runners.values()
+        one.handle_message = AsyncMock()
+        two.handle_message = AsyncMock()
+        private_event = SimpleNamespace(
+            chat_id=99,
+            sender_id=99,
+            is_private=True,
+            raw_text="下注成功 余额: 90",
+            message=SimpleNamespace(id=31, reply_to=None),
+        )
+        await self.manager.handle_message(private_event)
+        one.handle_message.assert_not_awaited()
+        two.handle_message.assert_awaited_once_with(private_event)
+
+        two.handle_message.reset_mock()
+        await self.manager.handle_message(self.event(-2))
+        two.handle_message.assert_awaited_once()
+
+        await self.manager.dashboard_action("set_delivery", {
+            "group_id": -2, "bet_delivery": "group"
+        })
+        self.assertEqual(two.bet_delivery, "group")
+        profiles = json.loads(self.manager.primary.store.setting("group_profiles_v1"))
+        self.assertEqual(profiles[0]["bet_delivery"], "group")
 
     async def test_discovery_and_real_routing_with_no_network(self):
         state = await self.manager.dashboard_action("list_groups", {})
@@ -198,6 +243,36 @@ class MultiGroupTests(unittest.IsolatedAsyncioTestCase):
                 "min_amount": 30, "max_amount": 10, "target_turnover": "100"})
         self.assertEqual(len(self.manager.runners), 2)
         self.client.send_message.assert_not_awaited()
+
+    async def test_remove_group_stops_it_archives_data_and_prevents_restart(self):
+        await self.add()
+        runner = self.manager.runners[-2]
+        await runner.handle_open("SL_REMOVE", 1, "")
+        original_folder = runner.store.path.parent
+        self.assertTrue(original_folder.exists())
+
+        state = await self.manager.dashboard_action(
+            "remove_group", {"group_id": -2}
+        )
+        self.assertNotIn(-2, self.manager.runners)
+        self.assertEqual(self.manager.profiles, [])
+        self.assertEqual(state["removed_group_id"], -2)
+        archived = Path(state["archived_group_path"])
+        self.assertTrue(archived.exists())
+        self.assertTrue((archived / "rounds.sqlite3").exists())
+        self.assertFalse(original_folder.exists())
+
+        default_state = await self.manager.dashboard_action(
+            "remove_group", {"group_id": -1}
+        )
+        self.assertEqual(default_state["groups"], [])
+        default_archive = Path(default_state["archived_group_path"])
+        self.assertTrue((default_archive / "rounds.sqlite3").exists())
+
+        await self.manager.close()
+        self.manager = self.make_manager()
+        await self.manager.load()
+        self.assertEqual(self.manager.runners, {})
 
     async def test_unavailable_saved_group_is_reported_and_can_retry(self):
         await self.add()
