@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -5,7 +6,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from parsers import normalize_bet_sides, result_sides
+from parsers import normalize_bet_delivery, normalize_bet_sides, result_sides
 from tg_big_bet import BigBetRunner, Store, positive_decimal, random_bet_amount
 
 
@@ -32,6 +33,12 @@ class StrategyTests(unittest.TestCase):
         for invalid in ([], ["红"], None):
             with self.assertRaises(ValueError):
                 normalize_bet_sides(invalid)
+
+    def test_bet_delivery_is_validated(self):
+        self.assertEqual(normalize_bet_delivery(None), "group")
+        self.assertEqual(normalize_bet_delivery("private_bot"), "private_bot")
+        with self.assertRaises(ValueError):
+            normalize_bet_delivery("private_chat")
 
     def test_turnover_counts_only_successful_bets_for_each_mode(self):
         with TemporaryDirectory() as directory:
@@ -141,6 +148,44 @@ class RunnerStrategyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(restored.game_mode, "instant_dice")
                 self.assertEqual(restored.instant_interval, 17)
             finally:
+                store.conn.close()
+
+    async def test_scheduled_mode_reads_group_but_sends_bet_to_bot_private_chat(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "private-bet.sqlite3"
+            store = Store(path)
+            bot = object()
+            client = SimpleNamespace(
+                get_entity=AsyncMock(return_value=bot),
+                send_message=AsyncMock(return_value=SimpleNamespace(id=88)),
+            )
+            runner = BigBetRunner(
+                client=client,
+                group=object(),
+                group_id=-7,
+                bot_id=99,
+                store=store,
+                min_amount=10,
+                max_amount=10,
+                stop_turnover=Decimal("100"),
+                start_balance=Decimal("100"),
+                live=True,
+                ack_timeout=10,
+                report_dir=Path(directory) / "reports",
+                bet_delivery="private_bot",
+            )
+            try:
+                await runner.handle_open("SLPRIVATE1", 1, "")
+                client.get_entity.assert_awaited_once_with(99)
+                client.send_message.assert_awaited_once_with(bot, "大10")
+                self.assertEqual(store.get("SLPRIVATE1")["send_status"], "sent")
+                state = await runner.dashboard_state()
+                self.assertEqual(state["bet_delivery"], "private_bot")
+                self.assertEqual(state["bet_delivery_label"], "机器人私聊")
+            finally:
+                for task in runner.timeout_tasks.values():
+                    task.cancel()
+                await asyncio.gather(*runner.timeout_tasks.values(), return_exceptions=True)
                 store.conn.close()
 
     async def test_dry_run_uses_one_random_amount_and_stops_at_turnover(self):
