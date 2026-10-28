@@ -22,21 +22,21 @@ async def main():
         await manager.dashboard_action("add_group", {"group_id": -2, "bot_id": 99,
             "min_amount": 20, "max_amount": 30, "target_turnover": "2000",
             "bet_sides": ["小", "双"], "game_mode": "instant_dice",
-            "instant_interval": 12})
+            "instant_interval": 12, "bet_delivery": "private_bot"})
         await primary.handle_open("SL654928300501070", 1, "")
         await primary.handle_result("SL654928300501070", 5, 2, "")
         accounts = AccountRegistry(client, manager, BigBetRunner, Store,
             accounts_root=root / "accounts", live=False, ack_timeout=10, proxy=None,
             shared_api_id=12345678,
             shared_api_hash="0123456789abcdef0123456789abcdef",
-            default_label="演示账号 A", default_username="demo_a", default_user_id=1001)
+            default_label="演示账号 A", default_username="aghaststar", default_user_id=1001)
         empty_manager = MultiGroupManager(client, None, BigBetRunner, Store,
             root_dir=root / "account-b", live=False, ack_timeout=10)
         accounts.accounts["demo_b"] = AccountContext(
             account_id="demo_b", label="演示账号 B", display_name="第二个账号",
             username="demo_b", phone_mask="***8899", telegram_user_id=1002,
             client=None, manager=empty_manager, can_delete=True)
-        server = DashboardServer(accounts, asyncio.get_running_loop(), Path(__file__).parent / "web", port=8876)
+        server = DashboardServer(accounts, asyncio.get_running_loop(), Path(__file__).parent / "web", port=8877)
         print(server.start(), flush=True)
         try:
             await asyncio.sleep(1800)
